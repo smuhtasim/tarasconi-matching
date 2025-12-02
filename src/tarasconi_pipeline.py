@@ -1,7 +1,8 @@
+# %% Cell 1: Imports & Setup
 import pandas as pd
 import re
 import ast
-from rapidfuzz import fuzz, process  # ADDED 'process' HERE
+from rapidfuzz import fuzz, process
 from tqdm import tqdm
 
 # 1. Load Data
@@ -222,3 +223,103 @@ if len(all_matches) > 0:
     print("Step 1 Results saved to data/step1_organization_matches.csv")
 else:
     print("No matches found at all. Check data alignment.")
+
+# %% Cell 9: Step 2 - People Validation Logic
+print("Starting Step 2: People Validation...")
+
+# 1. Load Step 1 Results
+# ---------------------------------------------------------
+try:
+    step1_matches = pd.read_csv('data/step1_organization_matches.csv')
+    print(f"Loaded {len(step1_matches)} potential organization matches.")
+except FileNotFoundError:
+    print("Error: Step 1 file not found. Please run the previous cells first.")
+    # In a notebook, you might want to stop execution here
+    # raise SystemExit("Stopping execution.")
+
+# 2. Prepare People Data (Crunchbase)
+# ---------------------------------------------------------
+print("Preparing Crunchbase People...")
+# We only care about people linked to companies in our match list
+relevant_cb_ids = step1_matches['company_id'].unique()
+relevant_people = people[people['company_id'].isin(relevant_cb_ids)].copy()
+
+# Harmonize Names
+relevant_people['full_name'] = relevant_people['first_name'].astype(str) + " " + relevant_people['last_name'].astype(str)
+relevant_people['clean_name'] = relevant_people['full_name'].apply(clean_name)
+
+# 3. Prepare Inventor Data (PATSTAT)
+# ---------------------------------------------------------
+print("Preparing PATSTAT Inventors...")
+# We need to link Applicants -> Appln_ID -> Inventors
+# a. Get the person_ids (Applicants) from our matches
+relevant_pat_ids = step1_matches['person_id'].unique()
+
+# b. Get all patent applications (appln_id) owned by these applicants
+# Note: In the raw files provided, 'applicants' table links person_id <-> appln_id
+relevant_apps = applicants[applicants['person_id'].isin(relevant_pat_ids)][['person_id', 'appln_id']]
+
+# c. Get inventors for those specific applications
+# Filter inventors table to only relevant appln_ids
+relevant_inv = inventors[inventors['appln_id'].isin(relevant_apps['appln_id'])].copy()
+relevant_inv['clean_name'] = relevant_inv['person_name'].apply(clean_name)
+
+# 4. The Validation Loop (Vectorized)
+# ---------------------------------------------------------
+print("Running Validation Cross-Check...")
+
+# Strategy:
+# 1. Create a set of (company_id, clean_person_name) from Crunchbase
+# 2. Create a set of (person_id, clean_inventor_name) from PATSTAT
+# 3. Join them via the Step 1 Match table
+
+# A. Flatten Crunchbase People
+# Structure: | company_id | cb_person_name |
+cb_people_lookup = relevant_people[['company_id', 'clean_name']].drop_duplicates()
+cb_people_lookup.rename(columns={'clean_name': 'cb_person'}, inplace=True)
+
+# B. Flatten PATSTAT Inventors
+# We need to map Inventor Name -> Applicant ID (person_id)
+# Join Inventors with the Applicant-Application link table
+pat_inv_lookup = pd.merge(relevant_inv[['appln_id', 'clean_name']], 
+                          relevant_apps[['appln_id', 'person_id']], 
+                          on='appln_id')
+# Structure: | person_id (Applicant) | pat_person (Inventor) |
+pat_inv_lookup = pat_inv_lookup[['person_id', 'clean_name']].drop_duplicates()
+pat_inv_lookup.rename(columns={'clean_name': 'pat_person'}, inplace=True)
+
+# C. Merge Everything
+# Start with the Step 1 Matches
+validation_table = pd.merge(step1_matches, cb_people_lookup, on='company_id', how='left')
+validation_table = pd.merge(validation_table, pat_inv_lookup, on='person_id', how='left')
+
+# D. Check for Intersections
+# We look for rows where cb_person == pat_person
+# (Using exact match on cleaned names for speed. Fuzzy can be used here too if strictness allows)
+validated_rows = validation_table[
+    (validation_table['cb_person'].notna()) & 
+    (validation_table['pat_person'].notna()) & 
+    (validation_table['cb_person'] == validation_table['pat_person'])
+]
+
+# Extract the unique Company-Applicant pairs that were validated
+valid_pairs = validated_rows[['company_id', 'person_id']].drop_duplicates()
+valid_pairs['is_validated'] = True
+
+# 5. Integrate & Save
+# ---------------------------------------------------------
+print("Finalizing Results...")
+
+# Merge the validation flag back into the main results
+final_results = pd.merge(step1_matches, valid_pairs, on=['company_id', 'person_id'], how='left')
+final_results['is_validated'] = final_results['is_validated'].fillna(False)
+
+# Stats
+total = len(final_results)
+validated = final_results['is_validated'].sum()
+print(f"Total Matches from Step 1: {total}")
+print(f"Matches Validated by People: {validated} ({validated/total:.1%}%)")
+
+# Save
+final_results.to_csv("data/final_tarasconi_results.csv", index=False)
+print("Final results saved to 'data/final_tarasconi_results.csv'")
