@@ -311,3 +311,61 @@ else:
     final_results.to_csv("../data/final_tarasconi_results.csv", index=False)
     print("Final results saved.")
 
+# %% Cell 10: Check People Validation Logic
+# Assuming 'companies' and 'people' DataFrames are loaded
+# --- Define the specific match IDs ---
+TARGET_COMPANY_ID = 904
+TARGET_APPLICANT_ID = 70072854
+
+# --- Assuming DataFrames (companies, applicants, inventors, people) are loaded ---
+
+# 1. Find the Company's Name and People (Crunchbase Side)
+cb_org_details = companies[companies['company_id'] == TARGET_COMPANY_ID]
+cb_people_list = people[people['company_id'] == TARGET_COMPANY_ID]
+
+# 2. Find the Applicant's Name and Associated Patents (PATSTAT Side)
+pat_applicant_info = applicants[applicants['person_id'] == TARGET_APPLICANT_ID]
+
+# Extract all application IDs (appln_id) associated with this applicant
+# These are the patents that prove the validation
+associated_applns = pat_applicant_info['appln_id'].unique()
+
+# 3. Find the Inventors and Patent Titles
+# Filter inventors table to see who worked on these patents
+pat_inventors_list = inventors[inventors['appln_id'].isin(associated_applns)]
+
+# --------------------------------------------------------------------------------
+# STEP 2: PRINT AND VERIFY
+# --------------------------------------------------------------------------------
+
+print("=====================================================================")
+print(f"VERIFICATION FOR COMPANY ID: {TARGET_COMPANY_ID}")
+print("=====================================================================")
+
+# A. Display Organizational Match (Check Name and Country match validity)
+print("\nA. ORGANIZATIONAL MATCH (Name/Country):")
+print("-" * 50)
+print(f"CRUNCHBASE COMPANY NAME: {cb_org_details['name'].iloc[0]} ({cb_org_details['country'].iloc[0]})")
+print(f"PATSTAT APPLICANT NAME: {pat_applicant_info['person_name'].iloc[0]} ({pat_applicant_info['person_ctry_code'].iloc[0]})")
+
+# B. Display The Triangle of Trust (Check the Human Overlap)
+print("\nB. PEOPLE VALIDATION (Triangle of Trust):")
+print("-" * 50)
+
+# Extract cleaned names for easy comparison
+cb_person_names = cb_people_list['first_name'] + " " + cb_people_list['last_name']
+pat_inventor_names = pat_inventors_list['person_name'].unique()
+
+print("\n--- CRUNCHBASE PEOPLE (Founders/Executives) ---")
+print(cb_person_names.to_string(index=False))
+
+print("\n--- PATSTAT INVENTORS (Patent Authors) ---")
+# Show a list of all unique inventors on their patents
+print("\n".join(pat_inventor_names))
+
+print(f"\nTotal Patents Found: {len(associated_applns)}")
+
+# C. Display Validation Proof
+# Manually cross-check names from the two lists above.
+# If a name from the Crunchbase list appears in the PATSTAT list, the 'is_validated=True' flag is confirmed.
+# %%
