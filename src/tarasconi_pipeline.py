@@ -91,7 +91,9 @@ unmatched_companies = companies.copy()
 unmatched_applicants = applicants.copy() # Can filter this down if needed
 all_matches = []
 
-print("Preprocessing complete.")# %% Cell 5: Pass 1 - Exact String Match
+print("Preprocessing complete.")
+
+# %% Cell 5: Pass 1 - Exact String Match
 print("Running Pass 1: Exact Match...")
 
 exact_matches = pd.merge(
@@ -230,6 +232,11 @@ if step1_matches.empty:
 else:
     # 2. Prepare People Data (Crunchbase)
     # ---------------------------------------------------------
+    # exact_condition = (step1_matches['match_type'] == 'Exact')
+    # step1_matches = step1_matches[exact_condition]
+    # print(f"Total Exact Match rows found: {len(step1_matches)}")
+    # print("\nSample of Exact Matches:")
+    # print(step1_matches.head())
     print("Preparing Crunchbase People...")
     relevant_cb_ids = step1_matches['company_id'].unique()
     relevant_people = people[people['company_id'].isin(relevant_cb_ids)].copy()
@@ -314,8 +321,8 @@ else:
 # %% Cell 10: Check People Validation Logic
 # Assuming 'companies' and 'people' DataFrames are loaded
 # --- Define the specific match IDs ---
-TARGET_COMPANY_ID = 904
-TARGET_APPLICANT_ID = 70072854
+TARGET_COMPANY_ID = 161128
+TARGET_APPLICANT_ID = 45172035
 
 # --- Assuming DataFrames (companies, applicants, inventors, people) are loaded ---
 
