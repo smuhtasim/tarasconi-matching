@@ -375,4 +375,118 @@ print(f"\nTotal Patents Found: {len(associated_applns)}")
 # C. Display Validation Proof
 # Manually cross-check names from the two lists above.
 # If a name from the Crunchbase list appears in the PATSTAT list, the 'is_validated=True' flag is confirmed.
+# %% Cell 11: Setup
+import pandas as pd
+import torch
+from sentence_transformers import SentenceTransformer, util
+import gc # Garbage collection to manage RAM
+
+print("Loading Embedding Model...")
+# Load the lightweight model
+# If you have a GPU, this will automatically use it. If not, it uses CPU.
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+
+print(f"Model loaded on: {device}")
+
+# %% Cell 12: Load Data
+print("Loading Datasets...")
+
+# 1. Main Entities
+applicants = pd.read_parquet('../data/applicants.parquet')
+companies = pd.read_csv('../data/companies.csv', low_memory=False)
+
+# 2. Context Files (NACE & Patents)
+patent_nace = pd.read_parquet('../data/patent_nace.parquet')
+nace_codes = pd.read_parquet('../data/nace_codes.parquet')
+# We need patents.parquet now for Titles/Abstracts
+patents = pd.read_parquet('../data/patents.parquet')
+
+print("Data Loaded.")
+# %% Cell 13: Prepare PATSTAT Documents (Query Side)
+print("Enriching PATSTAT Data...")
+
+# A. Merge NACE Codes with Descriptions
+# "26.11" -> "Manufacture of electronic components"
+nace_rich = patent_nace.copy()
+
+# Aggregate NACE by Patent (One patent can have multiple codes)
+# Result: "Manufacture of electronics; Manufacture of boards"
+pat_nace_agg = nace_rich.groupby('appln_id')['nace2_descr'].apply(
+    lambda x: "; ".join(x.dropna().unique())
+).reset_index()
+
+# B. Get Patent Text (Title/Abstract)
+# Let's use Title for speed (Abstracts can be very long)
+pat_text = patents[['appln_id', 'title', 'abstract']].copy()
+pat_text['pat_context'] = pat_text['title'].fillna('') + ". " + pat_text['abstract'].fillna('').str[:200] # Limit abstract to 200 chars
+
+# C. Merge Text & NACE
+pat_full_context = pd.merge(pat_text, pat_nace_agg, on='appln_id', how='left')
+pat_full_context['full_text'] = (
+    "Industry: " + pat_full_context['nace2_descr'].fillna('Unknown') + 
+    ". Tech: " + pat_full_context['pat_context']
+)
+
+# D. Roll up to Applicant Level
+# An applicant might have 100 patents. We combine the text of their *top 3* most recent ones to save space.
+# Link Applicants to Patents
+app_pat_link = applicants[['person_id', 'appln_id', 'person_ctry_code']].merge(
+    pat_full_context[['appln_id', 'full_text']], 
+    on='appln_id', 
+    how='inner'
+)
+
+# Group by Person ID and combine text
+# This creates ONE string per Applicant
+applicant_docs = app_pat_link.groupby(['person_id', 'person_ctry_code'])['full_text'].apply(
+    lambda x: " | ".join(x.head(3)) # Take top 3 patent descriptions
+).reset_index()
+
+# Add Applicant Name
+# We need the name from the original table
+applicant_names = applicants[['person_id', 'person_name']].drop_duplicates('person_id')
+applicant_docs = pd.merge(applicant_docs, applicant_names, on='person_id')
+
+# Create Final Embedding String
+applicant_docs['embed_string'] = (
+    "Applicant: " + applicant_docs['person_name'] + 
+    ". Country: " + applicant_docs['person_ctry_code'].fillna('UNK') + 
+    ". " + applicant_docs['full_text']
+)
+
+print(f"Created {len(applicant_docs)} enriched applicant documents.")
+print("Sample:", applicant_docs['embed_string'].iloc[0][:100])
+# NEW STEP: Save enriched applicant data
+applicant_docs.to_parquet('../data/intermediate_pat_enriched.parquet', index=False)
+# %% Cell 14: Prepare Crunchbase Documents (Candidate Side)
+print("Enriching Crunchbase Data...")
+
+# Helper to clean lists "['Category']" -> "Category"
+def clean_cb_text(text):
+    if isinstance(text, str):
+        # Remove brackets/quotes
+        return text.replace("['", "").replace("']", "").replace("', '", ", ")
+    return str(text)
+
+companies['clean_desc'] = companies['cb_short_description'].fillna('') + " " + companies['pb_keywords'].fillna('')
+companies['clean_cats'] = companies['cb_category_list'].apply(clean_cb_text)
+
+# Create Final Embedding String
+# Structure: "Name. Description. Categories."
+companies['embed_string'] = (
+    "Startup: " + companies['name'].fillna('') + 
+    ". Loc: " + companies['std_country'].fillna('UNK') + # Assuming you have std_country from Step 1
+    ". Desc: " + companies['clean_desc'] + 
+    ". Cats: " + companies['clean_cats']
+)
+
+# Filter out empty rows to avoid errors
+companies = companies[companies['embed_string'].str.len() > 10].copy()
+
+print(f"Created {len(companies)} enriched startup documents.")
+# NEW STEP: Save enriched companies data
+companies.to_parquet('..data/intermediate_cb_enriched.parquet', index=False)
+
+
 # %%
