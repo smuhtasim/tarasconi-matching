@@ -91,6 +91,9 @@ unmatched_companies = companies.copy()
 unmatched_applicants = applicants.copy() # Can filter this down if needed
 all_matches = []
 
+applicants.to_csv("../data/preprocessed_applicants.csv", index=False)
+companies.to_csv("../data/preprocessed_companies.csv", index=False)
+
 print("Preprocessing complete.")
 
 # %% Cell 5: Pass 1 - Exact String Match
@@ -486,7 +489,7 @@ companies = companies[companies['embed_string'].str.len() > 10].copy()
 
 print(f"Created {len(companies)} enriched startup documents.")
 # NEW STEP: Save enriched companies data
-companies.to_parquet('..data/intermediate_cb_enriched.parquet', index=False)
+companies.to_parquet('../data/intermediate_cb_enriched.parquet', index=False)
 
 
 # %%
