@@ -4,6 +4,7 @@ import re
 import ast
 from rapidfuzz import fuzz, process
 from tqdm import tqdm
+import numpy as np
 
 # %% Cell 2: Load Data
 print("Loading datasets...")
@@ -462,18 +463,37 @@ print(f"Created {len(applicant_docs)} enriched applicant documents.")
 print("Sample:", applicant_docs['embed_string'].iloc[0][:100])
 # NEW STEP: Save enriched applicant data
 applicant_docs.to_parquet('../data/intermediate_pat_enriched.parquet', index=False)
+
 # %% Cell 14: Prepare Crunchbase Documents (Candidate Side)
 print("Enriching Crunchbase Data...")
 
 # Helper to clean lists "['Category']" -> "Category"
 def clean_cb_text(text):
-    if isinstance(text, str):
-        # Remove brackets/quotes
+    if pd.isna(text) or text is None:
+        return ""
+    
+    # If it's a list string (like "['Category']"), clean it up
+    if isinstance(text, str) and text.startswith("['"):
         return text.replace("['", "").replace("']", "").replace("', '", ", ")
     return str(text)
 
-companies['clean_desc'] = companies['cb_short_description'].fillna('') + " " + companies['pb_keywords'].fillna('')
+companies['clean_desc'] = (
+    companies['cb_short_description'].apply(clean_cb_text) + 
+    " " + companies['pb_keywords'].apply(clean_cb_text)
+).str.strip()
 companies['clean_cats'] = companies['cb_category_list'].apply(clean_cb_text)
+
+companies['final_desc'] = np.where(
+    companies['clean_desc'].str.len() > 5, 
+    companies['clean_desc'], 
+    'No Description Provided. Name is key.' # Imputation Text
+)
+
+companies['final_cats'] = np.where(
+    companies['clean_cats'].str.len() > 5,
+    companies['clean_cats'],
+    'No Categories Listed.' # Imputation Text
+)
 
 # Create Final Embedding String
 # Structure: "Name. Description. Categories."
@@ -485,11 +505,89 @@ companies['embed_string'] = (
 )
 
 # Filter out empty rows to avoid errors
-companies = companies[companies['embed_string'].str.len() > 10].copy()
+companies = companies[companies['embed_string'].str.len() > 30].copy()
 
 print(f"Created {len(companies)} enriched startup documents.")
+
+print("Sample (First non-empty entry):")
+# Find a non-trivial sample to demonstrate the fix
+non_empty_sample = companies[companies['final_desc'].str.contains('No Description Provided') == False].head(1)['embed_string']
+if not non_empty_sample.empty:
+    print(non_empty_sample.iloc[0][:150])
+else:
+    # If all samples are empty, print the first one with the fallback text
+    print(companies['embed_string'].iloc[0][:150])
 # NEW STEP: Save enriched companies data
 companies.to_parquet('../data/intermediate_cb_enriched.parquet', index=False)
 
 
+# %%
+valid_mask = companies['final_desc'].str.contains('No Description Provided') == True
+
+# Get the index of the first True value
+first_valid_index = valid_mask.idxmax()
+# Get the specific index of the first match
+
+
+print(f"Index of first non-empty sample: {first_valid_index}")
+
+# Inspect that specific row
+print(companies.loc[first_valid_index, 'embed_string'])
+# %% Cell 15: Generate Embeddings
+print("Encoding Crunchbase Candidates (This may take a few minutes)...")
+# Encode all startups into a matrix
+cb_embeddings = model.encode(
+    companies['embed_string'].tolist(), 
+    batch_size=64, 
+    show_progress_bar=True, 
+    convert_to_tensor=True
+)
+
+print("Encoding PATSTAT Queries (This may take longer)...")
+# For testing, let's just do the Ambiguous ones or a sample
+# If running fully, remove the .head()
+applicant_embeddings = model.encode(
+    applicant_docs['embed_string'].tolist(), 
+    batch_size=64, 
+    show_progress_bar=True, 
+    convert_to_tensor=True
+)
+
+print(f"CB Matrix: {cb_embeddings.shape}")
+print(f"PATSTAT Matrix: {applicant_embeddings.shape}")
+# %% Cell 16: Save Embeddings Aligned with IDs
+# 1. Convert Tensor to a List of NumPy arrays
+# We move it to CPU first, then to Numpy
+embeddings_np = cb_embeddings.cpu().numpy()
+
+# 2. Assign it back to your companies DataFrame
+# Now every company row has its own embedding vector
+companies['embedding'] = list(embeddings_np)
+
+# 3. Save the specific columns you need for the LLM step
+# You generally want the ID, the Text you used, and the Vector
+columns_to_save = ['company_id', 'embed_string', 'embedding']
+companies[columns_to_save].to_parquet('../data/embedded_crunchbase.parquet', index=False)
+
+print("Saved embeddings aligned with IDs to data/embedded_crunchbase.parquet")
+
+# %% Cell 17: Save Applicant Embeddings Aligned with IDs
+print("Saving Applicant Embeddings...")
+# --- 1. Convert Tensor to NumPy ---
+# Move the tensor from GPU (if applicable) to CPU memory, then convert to a NumPy array.
+embeddings_np = applicant_embeddings.cpu().numpy()
+
+# --- 2. Add the Vectors to the DataFrame ---
+# Convert the NumPy array of embeddings into a list of vectors,
+# where each element is a list of 384 numbers.
+applicant_docs['embedding'] = list(embeddings_np)
+
+# --- 3. Save the DataFrame as Parquet ---
+# Select the columns necessary for the retrieval and LLM steps: the ID, the string, and the vector.
+columns_to_save = ['person_id', 'embed_string', 'embedding']
+applicant_docs[columns_to_save].to_parquet('../data/embedded_patstat.parquet', index=False)
+
+print("Saved Applicant embeddings aligned with IDs to data/embedded_patstat.parquet")
+
+# Clean up memory
 # %%
