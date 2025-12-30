@@ -405,64 +405,177 @@ patent_nace = pd.read_parquet('../data/patent_nace.parquet')
 nace_codes = pd.read_parquet('../data/nace_codes.parquet')
 # We need patents.parquet now for Titles/Abstracts
 patents = pd.read_parquet('../data/patents.parquet')
+# %% Cell 12b: Merge Publication Dates
+usecols = ['appln_id', 'publn_date', 'ipc_class_symbol', 'cpc_class_symbol']
+df_dates = pd.read_csv(
+    '../data/cleantech_publn_date.csv', 
+    usecols=usecols,              # optional: converts string dates to datetime objects
+)
+
+merged_df = pd.merge(
+    applicants, 
+    df_dates, 
+    on='appln_id', 
+    how='left'
+)
+
+print(f"Parquet rows: {len(applicants)}")
+print(f"Merged rows: {len(merged_df)}")
+print(merged_df.head())
+
+# 5. Save the result (optional)
+merged_df.to_parquet('../data/combined_data.parquet')
 
 print("Data Loaded.")
+df_parquet = pd.read_parquet('../data/combined_data.parquet')
+# %% Cell 13 a: data merge and preprocessing for patent
+
+
+# --- 3. Define a Helper Function for Cleaning ---
+def aggregate_codes(series):
+    all_codes = []
+    
+    for item in series:
+        # 1. Handle actual List or Array objects
+        if isinstance(item, (list, np.ndarray, pd.Series)):
+            all_codes.extend([str(i) for i in item])
+        
+        # 2. Handle cases where the list is "hidden" inside a string like "['code1', 'code2']"
+        elif isinstance(item, str) and item.startswith('[') and item.endswith(']'):
+            # Strip brackets and split by comma, then clean quotes
+            parts = item.strip('[]').split(',')
+            all_codes.extend([p.strip().replace("'", "").replace('"', '') for p in parts])
+            
+        # 3. Handle single items
+        else:
+            all_codes.append(str(item))
+    
+    # Preprocessing individual codes
+    cleaned = []
+    for c in all_codes:
+        # Skip nulls or the literal string 'nan'
+        if pd.isna(c) or str(c).lower() == 'nan' or str(c) == 'None' or not c:
+            continue
+        
+        # Strip whitespace and collapse multiple spaces (H01L  21 -> H01L 21)
+        s = re.sub(r'\s+', ' ', str(c)).strip()
+        
+        if s:
+            cleaned.append(s)
+    
+    # Deduplicate and Join with '*'
+    unique_sorted = sorted(list(set(cleaned)))
+    return "*".join(unique_sorted) if unique_sorted else np.nan
+
+# --- 4. Aggregate the Parquet Data ---
+# Group by ID to handle multiple entries per application
+df_codes = df_parquet.groupby('appln_id').agg({
+    'ipc_class_symbol': aggregate_codes,
+    'cpc_class_symbol': aggregate_codes,
+    # Add other columns here if you need to aggregate them (e.g., 'title': 'first')
+}).reset_index()
+
+# Rename columns to indicate they are now cleaned/aggregated
+cols_to_use = df_dates.columns.difference(['ipc_class_symbol', 'cpc_class_symbol'])
+
+# --- 5. Merge Dataframes ---
+# Left join: We keep all IDs from our Codes dataset (or Dates, depending on priority).
+# Here we stick to the Dates file as the base if that's your master list.
+df_final = pd.merge(df_dates[cols_to_use], df_codes, on='appln_id', how='left')
+
+# --- 6. Create the "Combined" Column with Special Separator ---
+# We handle cases where one might be NaN by filling with empty strings
+df_final['ipc_cleaned'] = df_final['ipc_class_symbol'].fillna('')
+df_final['cpc_cleaned'] = df_final['cpc_class_symbol'].fillna('')
+
+# Combine format: IPC * IPC * IPC | CPC * CPC
+# The '|' acts as the special separator between the two systems
+df_final['combined_classifications'] = (
+    df_final['ipc_cleaned'] + " | " + df_final['cpc_cleaned']
+)
+
+# Clean up artifacts (e.g., if one side was empty, we might have " | code" or "code | ")
+df_final['combined_classifications'] = df_final['combined_classifications'].str.strip(' |')
+
+# --- 7. Inspection ---
+print("Sample of processed data:")
+print(df_final[['appln_id', 'publn_date', 'combined_classifications']].head())
+
+df_final.to_parquet('../data/combined_codes_dates.parquet')
+
+# %% Cell 13c: load all data for patent enrichment
+print(df_final.head())
+
 # %% Cell 13: Prepare PATSTAT Documents (Query Side)
 print("Enriching PATSTAT Data...")
 
-# A. Merge NACE Codes with Descriptions
-# "26.11" -> "Manufacture of electronic components"
-nace_rich = patent_nace.copy()
+patents = pd.read_parquet('../data/combined_codes_dates.parquet')
+applicants = pd.read_parquet('../data/applicants.parquet')
 
-# Aggregate NACE by Patent (One patent can have multiple codes)
-# Result: "Manufacture of electronics; Manufacture of boards"
-pat_nace_agg = nace_rich.groupby('appln_id')['nace2_descr'].apply(
-    lambda x: "; ".join(x.dropna().unique())
-).reset_index()
+print("Data Loaded. Starting Smart Profiling...")
 
-# B. Get Patent Text (Title/Abstract)
-# Let's use Title for speed (Abstracts can be very long)
-pat_text = patents[['appln_id', 'title', 'abstract']].copy()
-pat_text['pat_context'] = pat_text['title'].fillna('') + ". " + pat_text['abstract'].fillna('').str[:200] # Limit abstract to 200 chars
+# --- STEP A: Create the "Rich Text" for each Patent ---
+# We use the 'combined_classifications' you just perfected.
+# We also extract a 'subclass' (first 4 chars) for the "Top Sectors" statistical calculation.
+def extract_subclasses(text):
+    if pd.isna(text) or text == '': return []
+    # Find all codes, but only keep the first 4 chars (e.g., H01L)
+    # We split by * and | to get individual codes
+    codes = re.split(r'[*|]', text)
+    return [c.strip()[:4] for c in codes if len(c.strip()) >= 4]
 
-# C. Merge Text & NACE
-pat_full_context = pd.merge(pat_text, pat_nace_agg, on='appln_id', how='left')
-pat_full_context['full_text'] = (
-    "Industry: " + pat_full_context['nace2_descr'].fillna('Unknown') + 
-    ". Tech: " + pat_full_context['pat_context']
+patents['subclasses'] = patents['combined_classifications'].apply(extract_subclasses)
+
+# Create the text blob for the individual patent
+# Note: We include the FULL classification string here for deep context
+patents['full_text'] = (
+    "Title: " + patents['title'].fillna('No Title') + 
+    ". Classes: " + patents['combined_classifications'].fillna('') + 
+    ". Abstract: " + patents['abstract'].fillna('').str.slice(0, 300)
 )
 
-# D. Roll up to Applicant Level
-# An applicant might have 100 patents. We combine the text of their *top 3* most recent ones to save space.
-# Link Applicants to Patents
+# --- STEP B: Link Patents to Applicants ---
 app_pat_link = applicants[['person_id', 'appln_id', 'person_ctry_code']].merge(
-    pat_full_context[['appln_id', 'full_text']], 
-    on='appln_id', 
+    patents[['appln_id', 'full_text', 'publn_date', 'subclasses']],
+    on='appln_id',
     how='inner'
 )
 
-# Group by Person ID and combine text
-# This creates ONE string per Applicant
-applicant_docs = app_pat_link.groupby(['person_id', 'person_ctry_code'])['full_text'].apply(
-    lambda x: " | ".join(x.head(3)) # Take top 3 patent descriptions
-).reset_index()
+# --- STEP C: The "Smart" Sort (Most Recent First) ---
+print("Sorting patents by date...")
+app_pat_link = app_pat_link.sort_values(by=['person_id', 'publn_date'], ascending=[True, False])
 
-# Add Applicant Name
-# We need the name from the original table
-applicant_names = applicants[['person_id', 'person_name']].drop_duplicates('person_id')
-applicant_docs = pd.merge(applicant_docs, applicant_names, on='person_id')
+# --- STEP D: Aggregate to Applicant Level ---
+def aggregate_profile(x):
+    # 1. Recent Text: Take top 3 recent patents
+    recent_text = " || ".join(x['full_text'].head(3))
+    
+    # 2. Dominant Tech: Flatten the list of subclasses and find the most frequent
+    all_subs = [item for sublist in x['subclasses'] for item in sublist]
+    if all_subs:
+        top_subs = pd.Series(all_subs).value_counts().head(3).index.tolist()
+        ipc_string = ", ".join(top_subs)
+    else:
+        ipc_string = "Unknown"
+    
+    return pd.Series({'recent_patents': recent_text, 'top_sectors': ipc_string})
 
-# Create Final Embedding String
+print("Grouping by Applicant...")
+applicant_docs = app_pat_link.groupby(['person_id', 'person_ctry_code']).apply(aggregate_profile).reset_index()
+
+# --- STEP E: Create Final Embedding String ---
 applicant_docs['embed_string'] = (
-    "Applicant: " + applicant_docs['person_name'] + 
-    ". Country: " + applicant_docs['person_ctry_code'].fillna('UNK') + 
-    ". " + applicant_docs['full_text']
+    "Applicant Country: " + applicant_docs['person_ctry_code'].fillna('UNK') + 
+    ". Top Tech Sectors: " + applicant_docs['top_sectors'] + 
+    ". Recent Patent History: " + applicant_docs['recent_patents']
 )
 
-print(f"Created {len(applicant_docs)} enriched applicant documents.")
-print("Sample:", applicant_docs['embed_string'].iloc[0][:100])
-# NEW STEP: Save enriched applicant data
-applicant_docs.to_parquet('../data/intermediate_pat_enriched.parquet', index=False)
+print(f"Created {len(applicant_docs)} smart applicant profiles.")
+print("\nSample Embedding String (first 500 chars):")
+print(applicant_docs['embed_string'].iloc[0][:500])
+
+# Save immediately
+applicant_docs.to_parquet('../data/intermediate_pat_smart_enriched.parquet', index=False)
 
 # %% Cell 14: Prepare Crunchbase Documents (Candidate Side)
 print("Enriching Crunchbase Data...")
@@ -588,6 +701,155 @@ columns_to_save = ['person_id', 'embed_string', 'embedding']
 applicant_docs[columns_to_save].to_parquet('../data/embedded_patstat.parquet', index=False)
 
 print("Saved Applicant embeddings aligned with IDs to data/embedded_patstat.parquet")
+# %% Cell 19: Load Embeddings for Retrieval
+import pandas as pd
+import torch
+
+print("Loading enriched datasets from Parquet files...")
+
+# 1. Load the Parquet files
+applicant_docs = pd.read_parquet('../data/embedded_patstat.parquet')
+companies_docs = pd.read_parquet('../data/embedded_crunchbase.parquet')
+
+
+# 3. JOIN the countries back to your embedded dataframes
+print("Patching missing country columns...")
+applicant_docs = applicant_docs.merge(applicants, on='person_id', how='left')
+companies_docs = companies_docs.merge(companies, on='company_id', how='left')
+
+# 4. Convert to Tensors (as before)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+applicant_embeddings = torch.tensor(applicant_docs['embedding'].tolist()).to(device)
+cb_embeddings = torch.tensor(companies_docs['embedding'].tolist()).to(device)
+
 
 # Clean up memory
+# %% Cell 16: Retrieval with Country Blocking
+from sentence_transformers import util
+print("Running Semantic Search with Country Blocking...")
+
+# We need a map to look up the original Company IDs
+cb_idx_to_id = companies['company_id'].reset_index(drop=True)
+# We also need the country for every row in the embedding matrix
+cb_countries = companies['std_country'].reset_index(drop=True).values
+
+results_list = []
+
+# Iterate through Applicants (Queries)
+# We do this in a loop because we need to apply the Country Filter *before* searching
+# Optimizing: We can group queries by country to speed this up
+
+unique_countries = applicant_docs['person_ctry_code'].unique()
+
+for country in unique_countries:
+    if country == 'UNKNOWN': continue
+    
+    # 1. Get Indices of Startups in this Country
+    # This is the "Hard Filter"
+    candidate_indices = [i for i, c in enumerate(cb_countries) if c == country]
+    
+    if not candidate_indices: continue # No startups in this country
+    
+    # Get the embedding subset for this country
+    country_cb_embeddings = cb_embeddings[candidate_indices]
+    
+    # 2. Get Indices of Applicants in this Country
+    # (In your df, you can just filter)
+    app_mask = applicant_docs['person_ctry_code'] == country
+    country_app_embeddings = applicant_embeddings[app_mask] # Be careful with tensor indexing
+    # We need the original IDs
+    current_app_ids = applicant_docs.loc[app_mask, 'person_id'].values
+    
+    # 3. Semantic Search (Cosine Similarity)
+    # Search for top-10 matches
+    hits = util.semantic_search(
+        country_app_embeddings, 
+        country_cb_embeddings, 
+        top_k=10
+    )
+    
+    # 4. Store Results
+    for i, query_hits in enumerate(hits):
+        app_id = current_app_ids[i]
+        
+        for hit in query_hits:
+            # hit contains {'corpus_id', 'score'}
+            # corpus_id is the index inside 'country_cb_embeddings'
+            # We need to map it back to the global 'candidate_indices'
+            local_idx = hit['corpus_id']
+            global_idx = candidate_indices[local_idx]
+            company_id = cb_idx_to_id[global_idx]
+            
+            results_list.append({
+                'person_id': app_id,
+                'company_id': company_id,
+                'semantic_score': hit['score'],
+                'rank': 1 # rank logic can be added
+            })
+
+print(f"Retrieval complete. Found {len(results_list)} candidate pairs.")
+# %%
+companies = pd.read_parquet('../data/embedded_crunchbase.parquet')
+print("Columns in companies:", companies.columns.tolist())
+# %% cell 19: Save Semantic Matches
+# Create the DataFrame
+matches_df = pd.DataFrame(results_list)
+
+# 1. Save the full results in a compressed format
+matches_df.to_parquet('../data/all_semantic_matches.parquet', index=False)
+print("Saved all 17M matches to Parquet.")
+
+# 2. Save a smaller, manageable CSV for manual inspection (e.g., top 10,000)
+matches_df.head(10000).to_csv('../data/sample_matches.csv', index=False)
+# %% cell 20: Inspect Sample Matches
+# Select a random sample of 10 matches to inspect
+sample_to_check = matches_df.sample(10).copy()
+
+# Join with applicant names/text
+sample_to_check = sample_to_check.merge(
+    applicant_docs[['person_id', 'embed_string']], 
+    on='person_id', 
+    how='left'
+).rename(columns={'embed_string': 'applicant_info'})
+
+# Join with company names/text
+sample_to_check = sample_to_check.merge(
+    companies_docs[['company_id', 'embed_string']], 
+    on='company_id', 
+    how='left'
+).rename(columns={'embed_string': 'company_info'})
+
+# Display the results
+for i, row in sample_to_check.iterrows():
+    print(f"--- Match {i+1} (Score: {row['semantic_score']:.4f}) ---")
+    print(f"APPLICANT: {row['applicant_info'][:200]}...")
+    print(f"STARTUP:   {row['company_info'][:200]}...")
+    print("\n")
+# %%
+import matplotlib.pyplot as plt
+
+plt.hist(matches_df['semantic_score'], bins=50)
+plt.title("Distribution of Semantic Scores")
+plt.xlabel("Cosine Similarity Score")
+plt.ylabel("Frequency")
+plt.show()
+# %%
+# 1. Filter for high-quality matches first
+high_score_matches = matches_df[matches_df['semantic_score'] > 0.70].copy()
+
+# 2. Select a sample (e.g., 10) from this high-quality group
+high_quality_sample = high_score_matches.sample(min(10, len(high_score_matches)))
+
+# 3. Join the text back (re-using the logic from before)
+# (Assuming cb_text_lookup and pat_text_lookup are still in memory)
+review_df = high_quality_sample.merge(applicant_docs, on='person_id', how='left') \
+                               .merge(companies_docs, on='company_id', how='left', suffixes=('_pat', '_cb'))
+
+# 4. Print results
+print(f"Showing {len(review_df)} High-Score Matches (> 0.70):\n")
+for _, row in review_df.iterrows():
+    print(f"SCORE: {row['semantic_score']:.4f}")
+    print(f"PATENT APP: {row['embed_string_pat'][:200]}...")
+    print(f"CB STARTUP: {row['embed_string_cb'][:200]}...")
+    print("-" * 30)
 # %%
