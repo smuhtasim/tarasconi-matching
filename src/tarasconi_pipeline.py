@@ -393,6 +393,7 @@ model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
 
 print(f"Model loaded on: {device}")
 
+
 # %% Cell 12: Load Data
 print("Loading Datasets...")
 
@@ -504,15 +505,33 @@ print(df_final[['appln_id', 'publn_date', 'combined_classifications']].head())
 df_final.to_parquet('../data/combined_codes_dates.parquet')
 
 # %% Cell 13c: load all data for patent enrichment
-print(df_final.head())
 
-# %% Cell 13: Prepare PATSTAT Documents (Query Side)
 print("Enriching PATSTAT Data...")
 
-patents = pd.read_parquet('../data/combined_codes_dates.parquet')
-applicants = pd.read_parquet('../data/applicants.parquet')
 
+
+if len(patents) != len(augmented_codes):
+    print(f"⚠️ Warning: Length mismatch! Patents: {len(patents)}, Augmented: {len(augmented_codes)}")
+
+# 2. Check if the index values are identical
+index_match = patents.index.equals(augmented_codes.index)
+
+if not index_match:
+    print("❌ Indexes do NOT match. Concatenation will create NaNs.")
+    # Check if they at least have the same IDs so we can fix it
+    missing_in_aug = patents.index.difference(augmented_codes.index)
+    print(f"Items in Patents missing from Augmented: {len(missing_in_aug)}")
+else:
+    print("✅ Indexes match perfectly. Safe to combine.")
+
+
+# %% Cell 13: Prepare PATSTAT Documents (Query Side)
+patents = pd.read_parquet('../data/patents.parquet')
+augmented_codes = pd.read_parquet('../data/combined_codes_dates.parquet')
+applicants = pd.read_parquet('../data/applicants.parquet')
 print("Data Loaded. Starting Smart Profiling...")
+
+
 
 # --- STEP A: Create the "Rich Text" for each Patent ---
 # We use the 'combined_classifications' you just perfected.
@@ -524,19 +543,33 @@ def extract_subclasses(text):
     codes = re.split(r'[*|]', text)
     return [c.strip()[:4] for c in codes if len(c.strip()) >= 4]
 
-patents['subclasses'] = patents['combined_classifications'].apply(extract_subclasses)
+
+
+augmented_codes['subclasses'] = augmented_codes['combined_classifications'].apply(extract_subclasses)
 
 # Create the text blob for the individual patent
 # Note: We include the FULL classification string here for deep context
-patents['full_text'] = (
-    "Title: " + patents['title'].fillna('No Title') + 
-    ". Classes: " + patents['combined_classifications'].fillna('') + 
-    ". Abstract: " + patents['abstract'].fillna('').str.slice(0, 300)
+combined_df = pd.merge(
+    patents[['appln_id', 'title', 'abstract']], 
+    augmented_codes[['appln_id', 'combined_classifications', 'subclasses', 'publn_date']], 
+    on='appln_id', 
+    how='left'
 )
+
+# --- 2. Now create full_text safely within the same DataFrame ---
+combined_df['full_text'] = (
+    "Title: " + combined_df['title'].fillna('No Title').astype(str) + 
+    ". Classes: " + combined_df['combined_classifications'].fillna('').astype(str) + 
+    ". Abstract: " + combined_df['abstract'].fillna('').str.slice(0, 300).astype(str)
+)
+
+# Verify no NaNs were created in the string concatenation
+nan_count = combined_df['full_text'].isna().sum()
+print(f"Number of NaN strings in full_text: {nan_count}")
 
 # --- STEP B: Link Patents to Applicants ---
 app_pat_link = applicants[['person_id', 'appln_id', 'person_ctry_code']].merge(
-    patents[['appln_id', 'full_text', 'publn_date', 'subclasses']],
+    combined_df[['appln_id', 'full_text', 'publn_date', 'subclasses']],
     on='appln_id',
     how='inner'
 )
@@ -647,6 +680,7 @@ print(f"Index of first non-empty sample: {first_valid_index}")
 # Inspect that specific row
 print(companies.loc[first_valid_index, 'embed_string'])
 # %% Cell 15: Generate Embeddings
+companies = pd.read_parquet('../data/intermediate_cb_enriched.parquet')
 print("Encoding Crunchbase Candidates (This may take a few minutes)...")
 # Encode all startups into a matrix
 cb_embeddings = model.encode(
@@ -656,6 +690,7 @@ cb_embeddings = model.encode(
     convert_to_tensor=True
 )
 
+applicant_docs = pd.read_parquet('../data/intermediate_pat_smart_enriched.parquet')
 print("Encoding PATSTAT Queries (This may take longer)...")
 # For testing, let's just do the Ambiguous ones or a sample
 # If running fully, remove the .head()
@@ -680,7 +715,7 @@ companies['embedding'] = list(embeddings_np)
 # 3. Save the specific columns you need for the LLM step
 # You generally want the ID, the Text you used, and the Vector
 columns_to_save = ['company_id', 'embed_string', 'embedding']
-companies[columns_to_save].to_parquet('../data/embedded_crunchbase.parquet', index=False)
+companies[columns_to_save].to_parquet('../data/modified_embedded_crunchbase.parquet', index=False)
 
 print("Saved embeddings aligned with IDs to data/embedded_crunchbase.parquet")
 
@@ -796,7 +831,7 @@ print("Columns in companies:", companies.columns.tolist())
 matches_df = pd.DataFrame(results_list)
 
 # 1. Save the full results in a compressed format
-matches_df.to_parquet('../data/all_semantic_matches.parquet', index=False)
+matches_df.to_parquet('../data/modified_all_semantic_matches.parquet', index=False)
 print("Saved all 17M matches to Parquet.")
 
 # 2. Save a smaller, manageable CSV for manual inspection (e.g., top 10,000)
@@ -822,8 +857,8 @@ sample_to_check = sample_to_check.merge(
 # Display the results
 for i, row in sample_to_check.iterrows():
     print(f"--- Match {i+1} (Score: {row['semantic_score']:.4f}) ---")
-    print(f"APPLICANT: {row['applicant_info'][:200]}...")
-    print(f"STARTUP:   {row['company_info'][:200]}...")
+    print(f"APPLICANT: {row['applicant_info'][:400]}...")
+    print(f"STARTUP:   {row['company_info'][:400]}...")
     print("\n")
 # %%
 import matplotlib.pyplot as plt
@@ -834,6 +869,7 @@ plt.xlabel("Cosine Similarity Score")
 plt.ylabel("Frequency")
 plt.show()
 # %%
+matches_df = pd.read_parquet('../data/modified_all_semantic_matches.parquet')
 # 1. Filter for high-quality matches first
 high_score_matches = matches_df[matches_df['semantic_score'] > 0.70].copy()
 
