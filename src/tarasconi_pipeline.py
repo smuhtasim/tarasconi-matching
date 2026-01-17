@@ -9,12 +9,12 @@ import numpy as np
 # %% Cell 2: Load Data
 print("Loading datasets...")
 # Added low_memory=False to fix the DtypeWarning
-companies = pd.read_csv('../data/companies.csv', low_memory=False)
+company_docs = pd.read_csv('../data/companies.csv', low_memory=False)
 people = pd.read_csv('../data/people.csv', low_memory=False)
 
 applicants = pd.read_parquet('../data/applicants.parquet')
 inventors = pd.read_parquet('../data/inventors.parquet')
-print(f"Companies: {companies.shape}, Applicants: {applicants.shape}")# %% Cell 3: Define Cleaning Functions
+print(f"Companies: {company_docs.shape}, Applicants: {applicants.shape}")# %% Cell 3: Define Cleaning Functions
 
 # Unpack lists like "['USA']" -> "USA"
 def unpack_list_string(text):
@@ -67,11 +67,11 @@ print("Functions defined.")
 print("Unpacking list strings in Crunchbase...")
 cols_to_unpack = ['name', 'legal_name', 'country', 'region', 'city']
 for col in cols_to_unpack:
-    if col in companies.columns:
-        companies[col] = companies[col].apply(unpack_list_string)
+    if col in company_docs.columns:
+        company_docs[col] = company_docs[col].apply(unpack_list_string)
 
 print("Harmonizing names...")
-companies['clean_name'] = companies['name'].apply(clean_name)
+company_docs['clean_name'] = company_docs['name'].apply(clean_name)
 applicants['clean_name'] = applicants['person_name'].apply(clean_name)
 
 print("Standardizing Country Codes...")
@@ -81,19 +81,19 @@ country_map = {
     'CAN': 'CA', 'CHN': 'CN', 'JPN': 'JP', 'KOR': 'KR',
     'ITA': 'IT', 'ESP': 'ES', 'IND': 'IN', 'ISR': 'IL'
 }
-companies['std_country'] = companies['country'].map(country_map).fillna(companies['country'])
+company_docs['std_country'] = company_docs['country'].map(country_map).fillna(company_docs['country'])
 
 # Handle Missing Countries
-companies['std_country'] = companies['std_country'].fillna('UNKNOWN')
+company_docs['std_country'] = company_docs['std_country'].fillna('UNKNOWN')
 applicants['person_ctry_code'] = applicants['person_ctry_code'].fillna('UNKNOWN')
 
 # Prepare pool for matching
-unmatched_companies = companies.copy()
+unmatched_companies = company_docs.copy()
 unmatched_applicants = applicants.copy() # Can filter this down if needed
 all_matches = []
 
 applicants.to_csv("../data/preprocessed_applicants.csv", index=False)
-companies.to_csv("../data/preprocessed_companies.csv", index=False)
+company_docs.to_csv("../data/preprocessed_companies.csv", index=False)
 
 print("Preprocessing complete.")
 
@@ -331,7 +331,7 @@ TARGET_APPLICANT_ID = 45172035
 # --- Assuming DataFrames (companies, applicants, inventors, people) are loaded ---
 
 # 1. Find the Company's Name and People (Crunchbase Side)
-cb_org_details = companies[companies['company_id'] == TARGET_COMPANY_ID]
+cb_org_details = company_docs[company_docs['company_id'] == TARGET_COMPANY_ID]
 cb_people_list = people[people['company_id'] == TARGET_COMPANY_ID]
 
 # 2. Find the Applicant's Name and Associated Patents (PATSTAT Side)
@@ -399,7 +399,7 @@ print("Loading Datasets...")
 
 # 1. Main Entities
 applicants = pd.read_parquet('../data/applicants.parquet')
-companies = pd.read_csv('../data/companies.csv', low_memory=False)
+company_docs = pd.read_csv('../data/companies.csv', low_memory=False)
 
 # 2. Context Files (NACE & Patents)
 patent_nace = pd.read_parquet('../data/patent_nace.parquet')
@@ -610,6 +610,33 @@ print(applicant_docs['embed_string'].iloc[0][:500])
 # Save immediately
 applicant_docs.to_parquet('../data/intermediate_pat_smart_enriched.parquet', index=False)
 
+# %% Cell 13b: Re-Align Applicant Embeddings
+from sentence_transformers import SentenceTransformer
+import pandas as pd
+
+# 1. Load the NEW, sorted/grouped text data
+applicant_docs = pd.read_parquet('../data/intermediate_pat_smart_enriched.parquet')
+
+# 2. Load the Model
+model = SentenceTransformer('all-MiniLM-L6-v2') # Or your specific model
+
+# 3. Re-Create Embeddings
+print(f"Generating embeddings for {len(applicant_docs)} applicants...")
+# This ensures Vector 0 = Person 0, Vector 1 = Person 1
+applicant_embeddings = model.encode(
+    applicant_docs['embed_string'].tolist(), 
+    batch_size=32, 
+    show_progress_bar=True, 
+    convert_to_tensor=True
+)
+
+# 4. Save them immediately so they never get out of sync
+import pickle
+with open('../data/applicant_embeddings.pkl', 'wb') as f:
+    pickle.dump(applicant_embeddings, f)
+    
+print("Embeddings re-aligned and saved.")
+
 # %% Cell 14: Prepare Crunchbase Documents (Candidate Side)
 print("Enriching Crunchbase Data...")
 
@@ -623,52 +650,52 @@ def clean_cb_text(text):
         return text.replace("['", "").replace("']", "").replace("', '", ", ")
     return str(text)
 
-companies['clean_desc'] = (
-    companies['cb_short_description'].apply(clean_cb_text) + 
-    " " + companies['pb_keywords'].apply(clean_cb_text)
+company_docs['clean_desc'] = (
+    company_docs['cb_short_description'].apply(clean_cb_text) + 
+    " " + company_docs['pb_keywords'].apply(clean_cb_text)
 ).str.strip()
-companies['clean_cats'] = companies['cb_category_list'].apply(clean_cb_text)
+company_docs['clean_cats'] = company_docs['cb_category_list'].apply(clean_cb_text)
 
-companies['final_desc'] = np.where(
-    companies['clean_desc'].str.len() > 5, 
-    companies['clean_desc'], 
+company_docs['final_desc'] = np.where(
+    company_docs['clean_desc'].str.len() > 5, 
+    company_docs['clean_desc'], 
     'No Description Provided. Name is key.' # Imputation Text
 )
 
-companies['final_cats'] = np.where(
-    companies['clean_cats'].str.len() > 5,
-    companies['clean_cats'],
+company_docs['final_cats'] = np.where(
+    company_docs['clean_cats'].str.len() > 5,
+    company_docs['clean_cats'],
     'No Categories Listed.' # Imputation Text
 )
 
 # Create Final Embedding String
 # Structure: "Name. Description. Categories."
-companies['embed_string'] = (
-    "Startup: " + companies['name'].fillna('') + 
-    ". Loc: " + companies['std_country'].fillna('UNK') + # Assuming you have std_country from Step 1
-    ". Desc: " + companies['clean_desc'] + 
-    ". Cats: " + companies['clean_cats']
+company_docs['embed_string'] = (
+    "Startup: " + company_docs['name'].fillna('') + 
+    ". Loc: " + company_docs['std_country'].fillna('UNK') + # Assuming you have std_country from Step 1
+    ". Desc: " + company_docs['clean_desc'] + 
+    ". Cats: " + company_docs['clean_cats']
 )
 
 # Filter out empty rows to avoid errors
-companies = companies[companies['embed_string'].str.len() > 30].copy()
+company_docs = company_docs[company_docs['embed_string'].str.len() > 30].copy()
 
-print(f"Created {len(companies)} enriched startup documents.")
+print(f"Created {len(company_docs)} enriched startup documents.")
 
 print("Sample (First non-empty entry):")
 # Find a non-trivial sample to demonstrate the fix
-non_empty_sample = companies[companies['final_desc'].str.contains('No Description Provided') == False].head(1)['embed_string']
+non_empty_sample = company_docs[company_docs['final_desc'].str.contains('No Description Provided') == False].head(1)['embed_string']
 if not non_empty_sample.empty:
     print(non_empty_sample.iloc[0][:150])
 else:
     # If all samples are empty, print the first one with the fallback text
-    print(companies['embed_string'].iloc[0][:150])
+    print(company_docs['embed_string'].iloc[0][:150])
 # NEW STEP: Save enriched companies data
-companies.to_parquet('../data/intermediate_cb_enriched.parquet', index=False)
+company_docs.to_parquet('../data/intermediate_cb_enriched.parquet', index=False)
 
 
 # %%
-valid_mask = companies['final_desc'].str.contains('No Description Provided') == True
+valid_mask = company_docs['final_desc'].str.contains('No Description Provided') == True
 
 # Get the index of the first True value
 first_valid_index = valid_mask.idxmax()
@@ -678,13 +705,13 @@ first_valid_index = valid_mask.idxmax()
 print(f"Index of first non-empty sample: {first_valid_index}")
 
 # Inspect that specific row
-print(companies.loc[first_valid_index, 'embed_string'])
+print(company_docs.loc[first_valid_index, 'embed_string'])
 # %% Cell 15: Generate Embeddings
-companies = pd.read_parquet('../data/intermediate_cb_enriched.parquet')
+company_docs = pd.read_parquet('../data/intermediate_cb_enriched.parquet')
 print("Encoding Crunchbase Candidates (This may take a few minutes)...")
 # Encode all startups into a matrix
 cb_embeddings = model.encode(
-    companies['embed_string'].tolist(), 
+    company_docs['embed_string'].tolist(), 
     batch_size=64, 
     show_progress_bar=True, 
     convert_to_tensor=True
@@ -710,12 +737,12 @@ embeddings_np = cb_embeddings.cpu().numpy()
 
 # 2. Assign it back to your companies DataFrame
 # Now every company row has its own embedding vector
-companies['embedding'] = list(embeddings_np)
+company_docs['embedding'] = list(embeddings_np)
 
 # 3. Save the specific columns you need for the LLM step
 # You generally want the ID, the Text you used, and the Vector
 columns_to_save = ['company_id', 'embed_string', 'embedding']
-companies[columns_to_save].to_parquet('../data/modified_embedded_crunchbase.parquet', index=False)
+company_docs[columns_to_save].to_parquet('../data/modified_embedded_crunchbase.parquet', index=False)
 
 print("Saved embeddings aligned with IDs to data/embedded_crunchbase.parquet")
 
@@ -735,7 +762,79 @@ applicant_docs['embedding'] = list(embeddings_np)
 columns_to_save = ['person_id', 'embed_string', 'embedding']
 applicant_docs[columns_to_save].to_parquet('../data/embedded_patstat.parquet', index=False)
 
+# %% Check alignment between DataFrame and Embeddings
+import pickle
+import torch
+import io
+
+# Define a custom unpickler that redirects GPU data to CPU
+class CPU_Unpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == 'torch.storage' and name == '_load_from_bytes':
+            return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+        else:
+            return super().find_class(module, name)
+
+# --- Updated Verification Code ---
+import pandas as pd
+
+# 1. Load Data
+df_apps = pd.read_parquet('../data/intermediate_pat_smart_enriched.parquet')
+
+# 2. Load Embeddings using the Custom Unpickler
+print("Loading embeddings to CPU...")
+with open('../data/applicant_embeddings.pkl', 'rb') as f:
+    emb_apps = CPU_Unpickler(f).load()
+
+# 3. Check Alignment
+print(f"DataFrame Rows: {len(df_apps)}")
+print(f"Embedding Rows: {emb_apps.shape[0]}")
+
+if len(df_apps) != emb_apps.shape[0]:
+    print("🚨 FATAL: Lengths do not match. You must re-generate embeddings.")
+else:
+    print("✅ Lengths match. Proceeding to semantic search.")
+
+# 3. The "sanity check" isn't possible directly on vectors without the model, 
+# BUT we can ensure we don't sort after this point.
+# IF you sort here, you break the link.
+# df_apps = df_apps.sort_values(...) # <--- NEVER DO THIS AFTER LOADING EMBEDDINGS
+
 print("Saved Applicant embeddings aligned with IDs to data/embedded_patstat.parquet")
+
+# %% Cell 18: Generate Crunchbase Embeddings pickles
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+import pickle
+
+# 1. Load your Company Text Data
+# Use the file you have: 'intermediate_cb_enriched' or 'embedded_crunchbase'
+print("Loading Company Data...")
+company_docs = pd.read_parquet('../data/embedded_crunchbase.parquet') 
+# (Make sure this file has the 'embed_string' column)
+
+# 2. Load the Model
+# Important: Use the EXACT same model you used for Applicants
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# 3. Generate Embeddings
+print(f"Encoding {len(company_docs)} companies... (This might take a minute)")
+cb_embeddings = model.encode(
+    company_docs['embed_string'].tolist(), 
+    batch_size=32, 
+    show_progress_bar=True, 
+    convert_to_tensor=True
+)
+
+# 4. Save as Pickle (So your search code can find it)
+print("Saving embeddings to pickle...")
+with open('../data/crunchbase_embeddings.pkl', 'wb') as f:
+    pickle.dump(cb_embeddings, f)
+
+print("✅ Done! You can now run the Search Cell.")
+
+
+
 # %% Cell 19: Load Embeddings for Retrieval
 import pandas as pd
 import torch
@@ -748,14 +847,14 @@ companies_docs = pd.read_parquet('../data/embedded_crunchbase.parquet')
 
 
 # 3. JOIN the countries back to your embedded dataframes
-print("Patching missing country columns...")
-applicant_docs = applicant_docs.merge(applicants, on='person_id', how='left')
-companies_docs = companies_docs.merge(companies, on='company_id', how='left')
+# print("Patching missing country columns...")
+# applicant_docs = applicant_docs.merge(applicants, on='person_id', how='left')
+# companies_docs = companies_docs.merge(company_docs, on='company_id', how='left')
 
-# 4. Convert to Tensors (as before)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-applicant_embeddings = torch.tensor(applicant_docs['embedding'].tolist()).to(device)
-cb_embeddings = torch.tensor(companies_docs['embedding'].tolist()).to(device)
+# # 4. Convert to Tensors (as before)
+# device = "cuda" if torch.cuda.is_available() else "cpu"
+# applicant_embeddings = torch.tensor(applicant_docs['embedding'].tolist()).to(device)
+# cb_embeddings = torch.tensor(companies_docs['embedding'].tolist()).to(device)
 
 
 # Clean up memory
@@ -764,9 +863,9 @@ from sentence_transformers import util
 print("Running Semantic Search with Country Blocking...")
 
 # We need a map to look up the original Company IDs
-cb_idx_to_id = companies['company_id'].reset_index(drop=True)
+cb_idx_to_id = company_docs['company_id'].reset_index(drop=True)
 # We also need the country for every row in the embedding matrix
-cb_countries = companies['std_country'].reset_index(drop=True).values
+cb_countries = company_docs['std_country'].reset_index(drop=True).values
 
 results_list = []
 
@@ -824,18 +923,123 @@ for country in unique_countries:
 
 print(f"Retrieval complete. Found {len(results_list)} candidate pairs.")
 # %%
-companies = pd.read_parquet('../data/embedded_crunchbase.parquet')
-print("Columns in companies:", companies.columns.tolist())
+company_docs = pd.read_parquet('../data/embedded_crunchbase.parquet')
+print("Columns in companies:", company_docs.columns.tolist())
 # %% cell 19: Save Semantic Matches
 # Create the DataFrame
 matches_df = pd.DataFrame(results_list)
 
 # 1. Save the full results in a compressed format
-matches_df.to_parquet('../data/modified_all_semantic_matches.parquet', index=False)
-print("Saved all 17M matches to Parquet.")
+matches_df.to_parquet('../data/new_all_semantic_matches.parquet', index=False)
+
 
 # 2. Save a smaller, manageable CSV for manual inspection (e.g., top 10,000)
-matches_df.head(10000).to_csv('../data/sample_matches.csv', index=False)
+matches_df.head(10000).to_csv('../data/new_sample_matches.csv', index=False)
+
+# %% Cell 16: Retrieval with Country Blocking (New)
+from sentence_transformers import util
+import pandas as pd
+import pickle
+import torch
+import io
+
+# --- 1. Helper for CPU Loading (Since you are on CPU) ---
+class CPU_Unpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == 'torch.storage' and name == '_load_from_bytes':
+            return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+        else:
+            return super().find_class(module, name)
+
+print("Loading Data for Search...")
+
+# --- 2. Load APPLICANTS (Queries) ---
+# CRITICAL: Do not sort this DataFrame after loading!
+applicant_docs = pd.read_parquet('../data/intermediate_pat_smart_enriched.parquet')
+applicant_docs = applicant_docs.reset_index(drop=True) # Ensure standard 0..N index
+
+with open('../data/applicant_embeddings.pkl', 'rb') as f:
+    applicant_embeddings = CPU_Unpickler(f).load()
+
+# --- 3. Load COMPANIES (Targets) ---
+company_docs = pd.read_parquet('../data/embedded_crunchbase.parquet')
+# Ensure standard 0..N index for companies too
+company_docs = company_docs.reset_index(drop=True)
+
+# Load Company Embeddings
+# Assuming you saved these similarly; if not, adjust filename
+with open('../data/crunchbase_embeddings.pkl', 'rb') as f:
+    cb_embeddings = CPU_Unpickler(f).load()
+
+companies = pd.read_csv('../data/preprocessed_companies.csv')
+
+# --- 4. Setup Lookups ---
+# Map Index -> Company ID for fast lookup
+cb_idx_to_id = companies['company_id'].to_dict()
+# Get country list for filtering (aligned with cb_embeddings rows)
+cb_countries = companies['std_country'].values 
+
+results_list = []
+unique_countries = applicant_docs['person_ctry_code'].unique()
+
+print(f"Starting Search across {len(unique_countries)} countries...")
+
+# --- 5. The Search Loop ---
+for country in unique_countries:
+    if pd.isna(country) or country == 'UNKNOWN': continue
+    
+    # A. Get TARGET (Startup) Indices for this Country
+    # This gives us integers like [0, 5, 20...]
+    startup_indices = [i for i, c in enumerate(cb_countries) if c == country]
+    
+    if not startup_indices: continue # No startups in this country
+    
+    # Slice the embedding matrix (these are the 'corpus')
+    country_cb_embeddings = cb_embeddings[startup_indices]
+    
+    # B. Get QUERY (Applicant) Indices for this Country
+    # We use .index to get the exact integer positions in the main DataFrame
+    app_indices = applicant_docs.index[applicant_docs['person_ctry_code'] == country].tolist()
+    
+    if not app_indices: continue
+
+    # Slice the query embeddings
+    country_app_embeddings = applicant_embeddings[app_indices]
+    
+    # C. Perform Search (Cosine Similarity)
+    # Returns 10 matches for each applicant in this batch
+    hits = util.semantic_search(
+        country_app_embeddings, 
+        country_cb_embeddings, 
+        top_k=10
+    )
+    
+    # D. Map Results back to IDs
+    for i, query_hits in enumerate(hits):
+        # 'i' is the local index in the batch. 
+        # We need the global index to get the ID.
+        global_app_idx = app_indices[i]
+        app_id = applicant_docs.at[global_app_idx, 'person_id']
+        
+        for hit in query_hits:
+            # hit['corpus_id'] is the local index in the startup subset
+            local_startup_idx = hit['corpus_id']
+            
+            # Map to Global Startup Index
+            global_startup_idx = startup_indices[local_startup_idx]
+            
+            # Retrieve Company ID
+            company_id = cb_idx_to_id[global_startup_idx]
+            
+            results_list.append({
+                'person_id': app_id,
+                'company_id': company_id,
+                'semantic_score': hit['score'],
+                'rank': 1
+            })
+
+print(f"Search Complete. Found {len(results_list)} matches.")
+
 # %% cell 20: Inspect Sample Matches
 # Select a random sample of 10 matches to inspect
 sample_to_check = matches_df.sample(10).copy()
@@ -869,9 +1073,9 @@ plt.xlabel("Cosine Similarity Score")
 plt.ylabel("Frequency")
 plt.show()
 # %%
-matches_df = pd.read_parquet('../data/modified_all_semantic_matches.parquet')
+matches_df = pd.read_parquet('../data/new_all_semantic_matches.parquet')
 # 1. Filter for high-quality matches first
-high_score_matches = matches_df[matches_df['semantic_score'] > 0.70].copy()
+high_score_matches = matches_df[matches_df['semantic_score'] > 0.60].copy()
 
 # 2. Select a sample (e.g., 10) from this high-quality group
 high_quality_sample = high_score_matches.sample(min(10, len(high_score_matches)))
