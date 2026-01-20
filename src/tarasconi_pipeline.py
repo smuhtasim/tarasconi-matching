@@ -973,7 +973,15 @@ with open('../data/crunchbase_embeddings.pkl', 'rb') as f:
 
 companies = pd.read_csv('../data/preprocessed_companies.csv')
 
-# --- 4. Setup Lookups ---
+# --- 4. Load Name Lookups for Better Readability ---
+# Load applicants for person name mapping
+applicants = pd.read_csv('../data/preprocessed_applicants.csv', low_memory=False)
+person_name_map = applicants[['person_id', 'person_name']].drop_duplicates().set_index('person_id')['person_name'].to_dict()
+
+# Create company name mapping from company_docs
+company_name_map = company_docs.set_index('company_id')['embed_string'].to_dict()
+
+# --- 5. Setup Lookups ---
 # Map Index -> Company ID for fast lookup
 cb_idx_to_id = companies['company_id'].to_dict()
 # Get country list for filtering (aligned with cb_embeddings rows)
@@ -984,7 +992,7 @@ unique_countries = applicant_docs['person_ctry_code'].unique()
 
 print(f"Starting Search across {len(unique_countries)} countries...")
 
-# --- 5. The Search Loop ---
+# --- 6. The Search Loop ---
 for country in unique_countries:
     if pd.isna(country) or country == 'UNKNOWN': continue
     
@@ -1021,6 +1029,9 @@ for country in unique_countries:
         global_app_idx = app_indices[i]
         app_id = applicant_docs.at[global_app_idx, 'person_id']
         
+        # Get applicant name
+        person_name = person_name_map.get(app_id, "Unknown Applicant")
+        
         for hit in query_hits:
             # hit['corpus_id'] is the local index in the startup subset
             local_startup_idx = hit['corpus_id']
@@ -1031,11 +1042,17 @@ for country in unique_countries:
             # Retrieve Company ID
             company_id = cb_idx_to_id[global_startup_idx]
             
+            # Extract company name from embed_string (format: "Startup: {name} ...")
+            company_embed = company_name_map.get(company_id, "Unknown Company")
+            company_name = company_embed.split("Loc:")[0].replace("Startup:", "").strip() if "Loc:" in company_embed else "Unknown Company"
+            
             results_list.append({
                 'person_id': app_id,
+                'person_name': person_name,
                 'company_id': company_id,
+                'company_name': company_name,
                 'semantic_score': hit['score'],
-                'rank': 1
+                'rank': i+1
             })
 
 print(f"Search Complete. Found {len(results_list)} matches.")
@@ -1053,7 +1070,7 @@ sample_to_check = sample_to_check.merge(
 
 # Join with company names/text
 sample_to_check = sample_to_check.merge(
-    companies_docs[['company_id', 'embed_string']], 
+    company_docs[['company_id', 'embed_string']], 
     on='company_id', 
     how='left'
 ).rename(columns={'embed_string': 'company_info'})
@@ -1061,17 +1078,26 @@ sample_to_check = sample_to_check.merge(
 # Display the results
 for i, row in sample_to_check.iterrows():
     print(f"--- Match {i+1} (Score: {row['semantic_score']:.4f}) ---")
-    print(f"APPLICANT: {row['applicant_info'][:400]}...")
+    print(f"APPLICANT: ({row['person_name']}) {row['applicant_info'][:400]}...")
     print(f"STARTUP:   {row['company_info'][:400]}...")
     print("\n")
-# %%
+# %% Score Distribution
 import matplotlib.pyplot as plt
-
-plt.hist(matches_df['semantic_score'], bins=50)
-plt.title("Distribution of Semantic Scores")
-plt.xlabel("Cosine Similarity Score")
-plt.ylabel("Frequency")
+matches_df = pd.read_parquet('../data/new_all_semantic_matches.parquet')
+# Plot the distribution of semantic scores
+plt.hist(matches_df['semantic_score'], bins=50, color='skyblue', edgecolor='black')
+plt.title('Distribution of Semantic Scores')
+plt.xlabel('Cosine Similarity Score')
+plt.ylabel('Number of Matches')
+plt.axvline(x=0.5, color='red', linestyle='--', label='High Quality Threshold')
+plt.legend()
 plt.show()
+
+# %% Calculate counts for different thresholds
+tiers = [0.4, 0.5, 0.6, 0.7]
+for t in tiers:
+    count = len(matches_df[matches_df['semantic_score'] >= t])
+    print(f"Matches >= {t}: {count:,}")
 # %%
 matches_df = pd.read_parquet('../data/new_all_semantic_matches.parquet')
 # 1. Filter for high-quality matches first
@@ -1083,13 +1109,36 @@ high_quality_sample = high_score_matches.sample(min(10, len(high_score_matches))
 # 3. Join the text back (re-using the logic from before)
 # (Assuming cb_text_lookup and pat_text_lookup are still in memory)
 review_df = high_quality_sample.merge(applicant_docs, on='person_id', how='left') \
-                               .merge(companies_docs, on='company_id', how='left', suffixes=('_pat', '_cb'))
+                               .merge(company_docs, on='company_id', how='left', suffixes=('_pat', '_cb'))
 
 # 4. Print results
 print(f"Showing {len(review_df)} High-Score Matches (> 0.70):\n")
 for _, row in review_df.iterrows():
     print(f"SCORE: {row['semantic_score']:.4f}")
-    print(f"PATENT APP: {row['embed_string_pat'][:200]}...")
+    print(f"PATENT APP: ({row['person_name']}) {row['embed_string_pat'][:200]}...")
     print(f"CB STARTUP: {row['embed_string_cb'][:200]}...")
     print("-" * 30)
+# %% Generate the High-Confidence Report
+matches_df = pd.read_parquet('../data/new_all_semantic_matches.parquet')
+# 1. Filter for scores above 0.58 (High Confidence)
+high_conf_matches = matches_df[matches_df['semantic_score'] >= 0.50].copy()
+
+applicant_docs = pd.read_parquet('../data/intermediate_pat_enriched.parquet')
+companies = pd.read_parquet('../data/intermediate_cb_enriched.parquet')
+
+# Create lookup for Applicants
+# Replace 'doc_std_name' with 'person_name' if that is what your file uses
+applicant_names = applicant_docs[['person_id', 'person_name', 'person_ctry_code']].drop_duplicates()
+
+# Create lookup for Companies
+# 'companies' is the dataframe you loaded from modified_embedded_crunchbase.parquet
+company_names = companies[['company_id', 'legal_name', 'domain', 'country']].drop_duplicates()
+
+# 2. Add the actual names and countries for readability
+# (Assuming you have a mapping of person_id to name and company_id to name)
+final_report = high_conf_matches.merge(applicant_names, on='person_id').merge(company_names, on='company_id')
+
+# 3. Save as Excel or CSV for the supervisor
+final_report.to_csv('../data/top_semantic_matches_to_verify.csv', index=False)
+
 # %%
